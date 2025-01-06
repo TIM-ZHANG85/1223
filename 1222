@@ -1,0 +1,636 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+import xgboost as xgb
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from sklearn.preprocessing import StandardScaler
+from scipy import stats
+import os
+
+
+class AmazonInventoryForecast:
+    def __init__(self, seasonal_periods=52):
+        self.seasonal_periods = seasonal_periods
+        self.scaler = StandardScaler()
+        self.seasonal_patterns = None
+        self.daily_patterns = None
+
+    def preprocess_data(self, raw_data: pd.DataFrame, target_asin: str = None) -> pd.DataFrame:
+        """預處理數據，轉換中文列名為英文，並進行基本清理和日期補齊"""
+        # 重新命名列以匹配英語列名
+        raw_data = raw_data.rename(columns={
+            '日期': 'Date',
+            '(Parent) ASIN': 'Parent_ASIN',
+            '(Child) ASIN': 'Child_ASIN',
+            '標題': 'Title',
+            '不重複瀏覽量': 'UniquePageViews',
+            '不重複瀏覽量占比': 'UniquePageViewsRatio',
+            '頁面總瀏覽量': 'TotalPageViews',
+            '總瀏覽量占比': 'TotalPageViewsRatio',
+            '訂單總數': 'TotalOrders',
+            '訂單轉化率': 'ConversionRate',
+            '總銷售金額': 'TotalSalesAmount',
+            '訂單量': 'Units_Ordered'
+        })
+
+        # 轉換日期格式為pandas的datetime格式
+        raw_data['Date'] = pd.to_datetime(raw_data['Date'])
+
+        if target_asin:
+            # 過濾選擇的ASIN數據
+            raw_data = raw_data[(raw_data['Parent_ASIN'] == target_asin) | (raw_data['Child_ASIN'] == target_asin)]
+
+        # 確保數據按日期排序
+        raw_data = raw_data.sort_values('Date')
+
+        # 創建完整的日期範圍
+        date_range = pd.date_range(start=raw_data['Date'].min(),
+                                   end=raw_data['Date'].max(),
+                                   freq='D')
+
+        # 設置Date為索引以便重採樣
+        raw_data.set_index('Date', inplace=True)
+
+        # 重採樣到每日頻率並前向填充缺失值
+        raw_data = raw_data.reindex(date_range)
+
+        # 對不同類型的列使用不同的填充方法
+        numeric_columns = ['UniquePageViews', 'TotalPageViews', 'TotalOrders',
+                           'Units_Ordered', 'TotalSalesAmount']
+        ratio_columns = ['UniquePageViewsRatio', 'TotalPageViewsRatio', 'ConversionRate']
+        categorical_columns = ['Parent_ASIN', 'Child_ASIN', 'Title']
+
+        # 數值型列使用0填充
+        for col in numeric_columns:
+            if col in raw_data.columns:
+                raw_data[col] = raw_data[col].ffill().fillna(0)
+
+        # 比率型列使用前向填充，然後用0填充剩餘的NA
+        for col in ratio_columns:
+            if col in raw_data.columns:
+                raw_data[col] = raw_data[col].ffill().fillna(0)
+
+        # 分類型列使用前向填充
+        for col in categorical_columns:
+            if col in raw_data.columns:
+                raw_data[col] = raw_data[col].ffill()
+
+        # 重置索引，使Date成為列
+        raw_data = raw_data.reset_index()
+        raw_data = raw_data.rename(columns={'index': 'Date'})
+
+        return raw_data
+
+    def create_activity_dataset(self):
+        """創建亞馬遜活動數據集"""
+        activities = {
+            'Event': [
+                'Prime Day', 'Fall Prime Day', 'Black Friday',
+                'Prime Day', 'Fall Prime Day', 'Black Friday',
+                'Prime Day', 'Fall Prime Day', 'Black Friday',
+                'Prime Day', 'Fall Prime Day', 'Black Friday'
+            ],
+            'Start Date': [
+                '2021-06-21', '2021-10-13', '2021-11-26',
+                '2022-07-12', '2022-10-11', '2022-11-24',
+                '2023-07-11', '2023-10-10', '2023-11-17',
+                '2024-07-16', '2024-10-08', '2024-11-21'
+            ],
+            'End Date': [
+                '2021-06-22', '2021-10-14', '2021-11-29',
+                '2022-07-13', '2022-10-12', '2022-11-28',
+                '2023-07-12', '2023-10-11', '2023-11-27',
+                '2024-07-17', '2024-10-09', '2024-12-02'
+            ]
+        }
+
+        df = pd.DataFrame(activities)
+        df['Start Date'] = pd.to_datetime(df['Start Date'])
+        df['End Date'] = pd.to_datetime(df['End Date'])
+        return df
+
+    def detect_seasonal_patterns(self, data: pd.DataFrame, min_significance: float = 0.05) -> dict:
+        """從歷史數據中檢測季節性模式"""
+        monthly_sales = data.groupby(data['Date'].dt.month)['Units_Ordered'].mean()
+        monthly_z_scores = stats.zscore(monthly_sales)
+        peak_months = monthly_sales[monthly_z_scores > 1.96].index.tolist()
+
+        overall_mean = monthly_sales.mean()
+        significant_months = []
+        month_stats = {}
+
+        for month in range(1, 13):
+            month_data = data[data['Date'].dt.month == month]['Units_Ordered']
+            t_stat, p_value = stats.ttest_1samp(month_data, overall_mean)
+
+            month_stats[month] = {
+                'mean_sales': month_data.mean(),
+                'std_sales': month_data.std(),
+                'p_value': p_value,
+                'significant': p_value < min_significance and t_stat > 0
+            }
+
+            if month_stats[month]['significant']:
+                significant_months.append(month)
+
+        return {
+            'peak_months': peak_months,
+            'significant_months': significant_months,
+            'monthly_stats': month_stats,
+            'monthly_patterns': monthly_sales.to_dict()
+        }
+
+    def calculate_activity_impact(self, raw_data: pd.DataFrame, activity_df: pd.DataFrame,
+                                  window_size: int = 15) -> dict:
+        """計算每個活動的銷售影響"""
+        impact_factors = {}
+
+        for _, activity in activity_df.iterrows():
+            # 活動期間銷售
+            activity_mask = (raw_data['Date'] >= activity['Start Date']) & \
+                            (raw_data['Date'] <= activity['End Date'])
+            activity_sales = raw_data[activity_mask]['Units_Ordered'].mean()
+
+            # 活動前銷售
+            pre_start = activity['Start Date'] - timedelta(days=window_size)
+            pre_mask = (raw_data['Date'] >= pre_start) & \
+                       (raw_data['Date'] < activity['Start Date'])
+            pre_sales = raw_data[pre_mask]['Units_Ordered'].mean()
+
+            # 活動後銷售
+            post_end = activity['End Date'] + timedelta(days=window_size)
+            post_mask = (raw_data['Date'] > activity['End Date']) & \
+                        (raw_data['Date'] <= post_end)
+            post_sales = raw_data[post_mask]['Units_Ordered'].mean()
+
+            # 計算影響因子
+            normal_sales = (pre_sales + post_sales) / 2
+            impact_factor = activity_sales / normal_sales if normal_sales > 0 else 1.0
+
+            event_key = f"{activity['Event']}_{activity['Start Date'].year}"
+            impact_factors[event_key] = {
+                'impact_factor': impact_factor,
+                'activity_sales': activity_sales,
+                'normal_sales': normal_sales,
+                'duration': (activity['End Date'] - activity['Start Date']).days + 1
+            }
+
+        return impact_factors
+
+    def prepare_features_with_traffic(self, raw_data: pd.DataFrame, activity_df: pd.DataFrame) -> pd.DataFrame:
+        """準備預測特徵（包含流量數據）"""
+        df = raw_data.copy()
+
+        # 確保日期索引是連續的，並明確設定頻率
+        df['Date'] = pd.to_datetime(df['Date'])
+        df = df.set_index('Date')
+        df = df.asfreq('D')
+
+        # 基本時間特徵
+        df['DayOfWeek'] = df.index.dayofweek
+        df['Month'] = df.index.month
+        df['Year'] = df.index.year
+        df['DayOfMonth'] = df.index.day
+        df['WeekOfYear'] = df.index.isocalendar().week
+
+        # 檢查列是否存在
+        required_columns = ['UniquePageViews', 'TotalPageViews', 'ConversionRate']
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            raise ValueError(f"缺少必要的列: {missing_columns}")
+
+        # 季節性特徵
+        if self.seasonal_patterns is None:
+            self.seasonal_patterns = self.detect_seasonal_patterns(df.reset_index())
+
+        df['IsPeakMonth'] = df['Month'].isin(self.seasonal_patterns['peak_months']).astype(int)
+        df['MonthlyFactor'] = df['Month'].map(self.seasonal_patterns['monthly_patterns'])
+
+        # 處理缺失值
+        df = df.ffill().bfill()
+
+        return df.reset_index()
+
+    def train_forecast_model(self, prepared_data: pd.DataFrame, activity_impacts: dict,
+                             forecast_days: int = 90) -> dict:
+        """訓練預測模型"""
+        # 設置時間索引並明確指定頻率
+        data_for_sarima = prepared_data.set_index('Date')['Units_Ordered']
+        data_for_sarima.index = pd.DatetimeIndex(data_for_sarima.index).to_period('D')
+
+        # SARIMA模型
+        sarima_model = SARIMAX(data_for_sarima,
+                               order=(1, 1, 1),
+                               seasonal_order=(1, 1, 1, self.seasonal_periods),
+                               enforce_stationarity=False,
+                               enforce_invertibility=False,
+                               freq='D')  # 明確指定頻率
+        sarima_results = sarima_model.fit(disp=False)
+
+        # XGBoost模型
+        xgb_model = xgb.XGBRegressor(
+            n_estimators=100,
+            learning_rate=0.1,
+            max_depth=5,
+            objective='reg:squarederror',
+            n_jobs=-1
+        )
+
+        feature_cols = ['DayOfWeek', 'Month', 'DayOfMonth', 'WeekOfYear',
+                        'IsPeakMonth', 'MonthlyFactor', 'UniquePageViews',
+                        'TotalPageViews', 'ConversionRate']
+
+        X = prepared_data[feature_cols]
+        y = prepared_data['Units_Ordered']
+
+        xgb_model.fit(X, y)
+
+        return {
+            'sarima': sarima_results,
+            'xgboost': xgb_model,
+            'feature_cols': feature_cols
+        }
+
+    def generate_forecast(self, models: dict, prepared_data: pd.DataFrame, asin: str, forecast_days: int = 180) -> dict:
+        """生成預測結果，並包含ASIN信息"""
+        last_date = prepared_data['Date'].max()
+        forecast_dates = pd.date_range(start=last_date + timedelta(days=1),
+                                       periods=forecast_days, freq='D')
+
+        forecast_features = pd.DataFrame({
+            'Date': forecast_dates
+        })
+
+        # 添加基本時間特徵
+        forecast_features['DayOfWeek'] = forecast_features['Date'].dt.dayofweek
+        forecast_features['Month'] = forecast_features['Date'].dt.month
+        forecast_features['DayOfMonth'] = forecast_features['Date'].dt.day
+        forecast_features['WeekOfYear'] = forecast_features['Date'].dt.isocalendar().week
+        forecast_features['IsPeakMonth'] = forecast_features['Month'].isin(
+            self.seasonal_patterns['peak_months']).astype(int)
+        forecast_features['MonthlyFactor'] = forecast_features['Month'].map(
+            self.seasonal_patterns['monthly_patterns'])
+
+        # 使用歷史平均值
+        forecast_features['UniquePageViews'] = prepared_data['UniquePageViews'].mean()
+        forecast_features['TotalPageViews'] = prepared_data['TotalPageViews'].mean()
+        forecast_features['ConversionRate'] = prepared_data['ConversionRate'].mean()
+
+        # 預測
+        sarima_forecast = models['sarima'].forecast(steps=forecast_days)
+        xgb_forecast = models['xgboost'].predict(
+            forecast_features[models['feature_cols']])
+
+        # 組合預測
+        final_forecast = 0.6 * sarima_forecast + 0.4 * xgb_forecast
+
+        # 計算累計銷售
+        cumulative_sales = np.cumsum(final_forecast)
+
+        return {
+            'dates': forecast_dates,
+            'forecast': final_forecast,
+            'cumulative_sales': cumulative_sales,
+            'asin': asin
+        }
+
+    def calculate_safety_stock(self, historical_data: pd.DataFrame, forecast_df: pd.DataFrame) -> float:
+        """計算安全庫存"""
+        # 計算不同時期的需求變異
+        demand_30d = historical_data['Units_Ordered'].tail(30).std()
+        demand_90d = historical_data['Units_Ordered'].tail(90).std()
+        demand_120d = historical_data['Units_Ordered'].tail(120).std()
+
+        # 計算加權需求變異
+        weighted_demand_variation = (demand_30d * 0.2) + (demand_90d * 0.4) + (demand_120d * 0.4)
+
+        # 供應鏈延遲時間（製作+運輸，共4個月）
+        supply_chain_delay = 120
+
+        return weighted_demand_variation * np.sqrt(supply_chain_delay)
+
+    def calculate_inventory_needs(self, forecast_results: dict,
+                                  historical_data: pd.DataFrame,
+                                  replenishment_cycle_days: int = 120) -> pd.DataFrame:
+        """計算庫存需求和下單建議"""
+        # 創建單行的DataFrame，使用單個索引
+        forecast_df = pd.DataFrame({
+            'ASIN': [forecast_results['asin']],
+            'Date': [pd.Timestamp.now().strftime('%Y-%m-%d')],
+        })
+
+        # 使用 iloc 來正確訪問累積銷量
+        cumulative_sales = pd.Series(forecast_results['cumulative_sales'])
+        periods = [30, 60, 90, 120, 180]
+        for days in periods:
+            forecast_df[f'Cumulative_Sales_{days}d'] = [cumulative_sales.iloc[days - 1]]
+
+        # 保存日均預測銷量用於可視化
+        forecast_df['Daily_Forecast'] = [np.mean(forecast_results['forecast'])]
+
+        # 計算安全庫存
+        safety_stock = self.calculate_safety_stock(historical_data, forecast_df)
+        forecast_df['Safety_Stock'] = [safety_stock]
+
+        # 添加需要手動填寫的欄位
+        forecast_df['FBA_Inventory'] = [None]
+        forecast_df['Factory_Inventory'] = [None]
+        forecast_df['Ordered_Quantity'] = [None]
+
+        # 計算庫存流動速率（過去30天平均日銷量）
+        daily_sales_rate = historical_data['Units_Ordered'].tail(30).mean()
+        forecast_df['Daily_Sales_Rate'] = [daily_sales_rate]
+
+        # 計算所需庫存
+        required_inventory = daily_sales_rate * replenishment_cycle_days + safety_stock
+        forecast_df['Required_Inventory'] = [required_inventory]
+
+        # 設定公式
+
+        forecast_df['Fortune_sku'] = forecast_df.apply(
+            lambda row: f'=VLOOKUP(B{row.name + 2},品號資料表!$A$1:$I$300,2,FALSE)',
+            axis=1
+        )
+
+        forecast_df['Total_Current_Inventory'] = forecast_df.apply(
+            lambda row: f'=SUM(F{row.name + 2} : K{row.name + 2})', axis=1
+        )
+
+        forecast_df['MOS可銷售庫存月份'] = forecast_df.apply(
+            lambda row: f'=L{row.name + 2} / (O{row.name + 2} * 30)', axis=1
+        )
+
+        forecast_df['Inventory_Threshold'] = forecast_df.apply(
+            lambda row: f'=Q{row.name + 2} * 0.8', axis=1
+        )
+
+        # 計算 FBA 補貨建議，將公式作為 Excel 公式存儲
+        forecast_df['FBA_Restock_Recommendation'] = forecast_df.apply(
+            lambda
+                row: f'=IF((G{row.name + 2} + H{row.name + 2}) < S{row.name + 2}, "建議補貨" & S{row.name + 2} - (G{row.name + 2} + H{row.name + 2}), "庫存充足")',
+            axis=1
+        )
+
+        forecast_df['Order_Recommendation'] = forecast_df.apply(
+            lambda row: f'=IF(N{row.name + 2} < M{row.name + 2} , "需要下單", "庫存充足")',
+            axis=1
+        )
+
+        forecast_df['Suggested_Order_Quantity'] = forecast_df.apply(
+            lambda
+                row: f'=IF(P{row.name + 2} ="需要下單", M{row.name + 2} - K{row.name + 2} - N{row.name + 2}, 0)',
+            axis=1
+        )
+
+        # 保存預測數據用於可視化
+        forecast_df['Forecast_Dates'] = [forecast_results['dates']]
+        forecast_df['Forecast_Values'] = [forecast_results['forecast']]
+
+        return forecast_df
+
+    def visualize_forecast(self, forecast_df: pd.DataFrame, asin: str):
+        """產生新的預測視覺化圖表"""
+        plt.figure(figsize=(15, 10))
+
+        # 從保存的預測數據中獲取值並轉換為列表或numpy數組
+        dates = np.array(forecast_df['Forecast_Dates'].iloc[0])
+        forecast_values = np.array(forecast_df['Forecast_Values'].iloc[0])
+
+        # 繪製預測銷量線
+        plt.plot(dates, forecast_values, label='Daily Forecast', color='blue', linestyle='--')
+
+        # 添加累計銷售標記點
+        key_days = [30, 60, 90, 120, 180]
+        for day in key_days:
+            if day < len(dates):
+                cumulative_sale = forecast_df[f'Cumulative_Sales_{day}d'].iloc[0]
+                plt.plot(dates[day - 1], forecast_values[day - 1], 'ro', markersize=8)
+                plt.annotate(f'{day}days:\n{int(cumulative_sale):,}',
+                             xy=(dates[day - 1], forecast_values[day - 1]),
+                             xytext=(10, 10),
+                             textcoords='offset points')
+
+        plt.title(f'ASIN: {asin} Sales Forecast')
+        plt.xlabel('Date')
+        plt.ylabel('Sales Quantity')
+        plt.grid(True)
+        plt.legend()
+
+        # 保存圖表
+        os.makedirs('forecasts', exist_ok=True)  # 確保目錄存在
+        plt.savefig(f'forecasts/forecast_{asin}.png')
+        plt.close()
+
+    def export_to_excel(self, all_forecasts: list, historical_data: pd.DataFrame, output_path: str = 'forecasts'):
+        """匯出預測結果到Excel"""
+        try:
+            import xlsxwriter
+        except ImportError:
+            print("xlsxwriter 未安裝，使用基本 Excel 導出...")
+            os.makedirs(output_path, exist_ok=True)
+
+            # 設定所需的列順序，修正包含 'd' 的列名
+            columns_to_export = [
+                'Fortune_sku', 'ASIN',
+                'Cumulative_Sales_30d', 'Cumulative_Sales_60d', 'Cumulative_Sales_90d',  # 修正列名
+                'FBA_Inventory', 'FBA_Inbound', 'Factory_Inventory', 'Ordered_Quantity',
+                '金匯_Inventory', 'To金匯_Inbound', 'Total_Current_Inventory',
+                'Daily_Sales_Rate', 'MOS可銷售庫存月份', 'Required_Inventory',
+                'Inventory_Threshold', 'Safety_Stock', 'FBA_Restock_Recommendation',
+                'Order_Recommendation', 'Suggested_Order_Quantity',
+                'MOQ', '箱數', '下單時間', '交期'
+            ]
+
+            # 準備輸出數據
+            output_data = []
+            for forecast_df in all_forecasts:
+                df_copy = forecast_df.copy()
+
+                # 為不存在的列添加空值
+                for col in columns_to_export:
+                    if col not in df_copy.columns:
+                        df_copy[col] = None
+
+                # 按指定順序重排列
+                df_copy = df_copy[columns_to_export]
+                output_data.append(df_copy)
+
+            combined_df = pd.concat(output_data, ignore_index=True)
+
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            excel_path = os.path.join(output_path, f'inventory_forecast_{timestamp}.xlsx')
+            combined_df.to_excel(excel_path, index=False, engine='openpyxl')
+
+            return excel_path
+
+        # 使用 xlsxwriter 的完整格式化導出
+        os.makedirs(output_path, exist_ok=True)
+
+        # 設定所需的列順序，修正包含 'd' 的列名
+        columns_to_export = [
+            'Fortune_sku', 'ASIN',
+            'Cumulative_Sales_30d', 'Cumulative_Sales_60d', 'Cumulative_Sales_90d',  # 修正列名
+            'FBA_Inventory', 'FBA_Inbound', 'Factory_Inventory', 'Ordered_Quantity',
+            '金匯_Inventory', 'To金匯_Inbound', 'Total_Current_Inventory',
+            'Daily_Sales_Rate', 'MOS可銷售庫存月份', 'Required_Inventory',
+            'Inventory_Threshold', 'Safety_Stock', 'FBA_Restock_Recommendation',
+            'Order_Recommendation', 'Suggested_Order_Quantity',
+            'MOQ', '箱數', '下單時間', '交期'
+        ]
+
+        # 準備輸出數據
+        output_data = []
+        for forecast_df in all_forecasts:
+            df_copy = forecast_df.copy()
+
+            # 為不存在的列添加空值
+            for col in columns_to_export:
+                if col not in df_copy.columns:
+                    df_copy[col] = None
+
+            # 按指定順序重排列
+            existing_columns = [col for col in columns_to_export if col in df_copy.columns]
+            df_copy = df_copy[existing_columns]
+            output_data.append(df_copy)
+
+        combined_df = pd.concat(output_data, ignore_index=True)
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        excel_path = os.path.join(output_path, f'inventory_forecast_{timestamp}.xlsx')
+
+        writer = pd.ExcelWriter(excel_path, engine='xlsxwriter')
+        combined_df.to_excel(writer, sheet_name='Inventory_Forecast', index=False)
+
+        # 獲取工作簿和工作表對象
+        workbook = writer.book
+        worksheet = writer.sheets['Inventory_Forecast']
+
+        # 定義格式
+        header_format_default = workbook.add_format({
+            'bold': True,
+            'text_wrap': True,
+            'valign': 'top',
+            'bg_color': '#D9E1F2',  # 藍色背景
+            'border': 1
+        })
+
+        header_format_green = workbook.add_format({
+            'bold': True,
+            'text_wrap': True,
+            'valign': 'top',
+            'bg_color': '#C6EFCE',  # 綠色背景
+            'border': 1
+        })
+
+        header_format_yellow = workbook.add_format({
+            'bold': True,
+            'text_wrap': True,
+            'valign': 'top',
+            'bg_color': '#FFEB9C',  # 黃色背景
+            'border': 1
+        })
+
+        integer_format = workbook.add_format({
+            'num_format': '#,##0',
+            'border': 1
+        })
+
+        decimal_format = workbook.add_format({
+            'num_format': '#,##0.0',
+            'border': 1
+        })
+
+        default_format = workbook.add_format({
+            'border': 1
+        })
+
+        # 應用格式到標題
+        for col_num, col_name in enumerate(combined_df.columns):
+            # 根據列位置選擇不同的標題格式
+            if 5 <= col_num <= 11:  # F到L欄
+                header_format = header_format_green
+            elif 17 <= col_num <= 23:  # R到X欄
+                header_format = header_format_yellow
+            else:
+                header_format = header_format_default
+
+            worksheet.write(0, col_num, col_name, header_format)
+
+            # 設置列寬和數據格式
+            if col_name in ['Daily_Sales_Rate']:
+                worksheet.set_column(col_num, col_num, 15, decimal_format)
+            elif col_name in ['Fortune_sku', 'ASIN', 'Order_Recommendation']:
+                worksheet.set_column(col_num, col_num, 15, default_format)
+            else:
+                worksheet.set_column(col_num, col_num, 15, integer_format)
+
+        # 條件格式
+        worksheet.conditional_format('S2:S1048576', {  # Order_Recommendation 列
+            'type': 'text',
+            'criteria': 'containing',
+            'value': '需要下單',
+            'format': workbook.add_format({'bg_color': '#FFC7CE'})
+        })
+
+        writer.close()
+        print(f"預測結果已保存到: {excel_path}")
+
+        return excel_path
+
+    def run_full_analysis(self, file_path: str, target_asins: list = None, forecast_days: int = 180):
+        """執行完整的分析流程"""
+        print("開始讀取檔案...")
+        raw_data = pd.read_excel(file_path)
+
+        all_forecasts = []
+
+        # 如果沒有指定ASIN，使用數據中的所有唯一ASIN
+        if not target_asins:
+            target_asins = pd.concat([
+                raw_data['Parent_ASIN'].dropna(),
+                raw_data['Child_ASIN'].dropna()
+            ]).unique()
+
+        for asin in target_asins:
+            print(f"處理 ASIN: {asin}")
+
+            # 預處理該ASIN的數據
+            asin_data = self.preprocess_data(raw_data, asin)
+            activity_df = self.create_activity_dataset()
+            prepared_data = self.prepare_features_with_traffic(asin_data, activity_df)
+
+            # 訓練模型和生成預測
+            models = self.train_forecast_model(prepared_data, activity_impacts={})
+            forecast_results = self.generate_forecast(models, prepared_data, asin, forecast_days)
+
+            # 計算庫存需求
+            inventory_forecast = self.calculate_inventory_needs(forecast_results, asin_data)
+            all_forecasts.append(inventory_forecast)
+
+            # 生成視覺化圖表
+            self.visualize_forecast(inventory_forecast, asin)
+
+        # 匯出Excel
+        excel_path = self.export_to_excel(all_forecasts, raw_data)
+
+        print("分析完成！")
+        return excel_path, all_forecasts
+
+
+if __name__ == "__main__":
+    # 初始化預測類別
+    amazon_forecast = AmazonInventoryForecast()
+
+    # 設定檔案路徑
+    file_path = 'sales_data.xlsx'
+
+    # 設定要分析的ASIN列表
+    target_asins = ['B08F7QD63C']  # 可以添加更多ASIN
+
+    # 執行完整分析
+    excel_path, forecasts = amazon_forecast.run_full_analysis(
+        file_path,
+        target_asins=target_asins,
+        forecast_days=180
+    )
